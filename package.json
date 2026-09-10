@@ -1,0 +1,21 @@
+{
+  "name": "jianguoyun-webdav-proxy",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker reverse proxy for Jianguoyun WebDAV",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "keywords": [
+    "cloudflare",
+    "workers",
+    "webdav",
+    "jianguoyun"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "wrangler": "^3.100.0"
+  }
+}
