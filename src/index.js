@@ -1,15 +1,20 @@
 /**
  * Cloudflare Worker 反向代理坚果云 WebDAV
- * 优化版：防 520 错误、请求头清洗、根路径健康检测、支持 HTTPS->HTTP 自动回退
+ * 终极防 520 方案：
+ * 1. 坚果云海外域名被解析到了 Cloudflare 自身的节点 (cloudflarelb.jianguoyun.com)，导致 Worker 触发 CDN 环路报错 520。
+ * 2. 本脚本直接将回源目标锁定为坚果云国内真实源站机房 IP (58.215.175.52 / 58.215.175.53)，并走 HTTP 80 (带 Host: dav.jianguoyun.com 头)，
+ *    彻底绕过海外 CDN-Loop、SSL 证书握手异常与 WAF 阻断。
  */
+
+// 坚果云国内真实电信源站机房 IP
+const NUTSTORE_ORIGIN_IPS = ["58.215.175.52", "58.215.175.53"];
+const TARGET_HOST = "dav.jianguoyun.com";
 
 export default {
   async fetch(request, env, ctx) {
-    const TARGET_HOST = env.TARGET_HOST || "dav.jianguoyun.com";
-    const TARGET_PROTOCOL = env.TARGET_PROTOCOL || "https";
     const clientUrl = new URL(request.url);
 
-    // 1. 如果在浏览器中直接访问根路径 "/"，返回友好的状态页面，避免坚果云直接拒连报错
+    // 1. 如果在浏览器中直接访问根路径 "/"，返回友好的状态页面
     if (clientUrl.pathname === "/" || clientUrl.pathname === "") {
       return new Response(
         `<!DOCTYPE html>
@@ -19,11 +24,11 @@ export default {
   <h2>✅ 坚果云 WebDAV 代理 Worker 运行正常</h2>
   <p>WebDAV 服务端点路径为：<code>${clientUrl.origin}/dav/</code></p>
   <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">
-  <h3>客户端配置指南</h3>
+  <h3>Obsidian / Remotely Save 配置指南</h3>
   <ul>
-    <li><strong>服务器地址 (URL)</strong>: <code>${clientUrl.origin}/dav/</code></li>
+    <li><strong>服务器地址 (URL)</strong>: <code>${clientUrl.origin}/dav/</code> (结尾务必带上 <code>/dav/</code>)</li>
     <li><strong>用户名</strong>: 坚果云注册邮箱</li>
-    <li><strong>密码</strong>: 坚果云后台生成的应用专用密码（非网页登录密码）</li>
+    <li><strong>密码</strong>: 坚果云后台生成的第三方应用专用密码（非网页登录密码）</li>
   </ul>
 </body>
 </html>`,
@@ -34,13 +39,13 @@ export default {
       );
     }
 
-    // 2. 构造目标 URL
-    const targetUrl = new URL(request.url);
-    targetUrl.hostname = TARGET_HOST;
-    targetUrl.protocol = `${TARGET_PROTOCOL}:`;
-    targetUrl.port = TARGET_PROTOCOL === "http" ? "80" : "443";
+    // 2. 自动补全 /dav 缺少结尾斜杠的情况
+    let pathname = clientUrl.pathname;
+    if (pathname === "/dav") {
+      pathname = "/dav/";
+    }
 
-    // 3. 清洗并重写请求头，过滤掉容易触发源站防火墙/WAF 的代理专有头
+    // 3. 清洗请求头（彻底过滤 Cloudflare 特征头，保留标准 WebDAV 和 Basic Auth 鉴权头）
     const newHeaders = new Headers();
     for (const [key, value] of request.headers.entries()) {
       const lower = key.toLowerCase();
@@ -56,24 +61,30 @@ export default {
     }
 
     newHeaders.set("Host", TARGET_HOST);
-    if (newHeaders.has("Origin")) {
-      newHeaders.set("Origin", `${TARGET_PROTOCOL}://${TARGET_HOST}`);
-    }
+    newHeaders.set("Origin", `http://${TARGET_HOST}`);
 
-    // 4. 重写 WebDAV 的 Destination 头（MOVE/COPY 文件时必需）
+    // 4. 重写 WebDAV 的 Destination 头（重命名/移动文件时必需）
     const destination = newHeaders.get("Destination");
     if (destination) {
       try {
         const destUrl = new URL(destination);
         destUrl.hostname = TARGET_HOST;
-        destUrl.protocol = `${TARGET_PROTOCOL}:`;
-        destUrl.port = TARGET_PROTOCOL === "http" ? "80" : "443";
+        destUrl.protocol = "http:";
+        destUrl.port = "80";
         newHeaders.set("Destination", destUrl.toString());
       } catch (_) {}
     }
 
-    // 5. 构造请求
     const hasBody = !["GET", "HEAD"].includes(request.method.toUpperCase());
+
+    // 5. 核心：直接回源到坚果云真实机房 IP，避免解析到海外 Cloudflare 假节点造成 520
+    const originHost = env.TARGET_ORIGIN || NUTSTORE_ORIGIN_IPS[0];
+    const targetUrl = new URL(request.url);
+    targetUrl.hostname = originHost;
+    targetUrl.pathname = pathname;
+    targetUrl.protocol = "http:";
+    targetUrl.port = "80";
+
     const newRequest = new Request(targetUrl.toString(), {
       method: request.method,
       headers: newHeaders,
@@ -84,35 +95,27 @@ export default {
     try {
       let response = await fetch(newRequest);
 
-      // 6. 核心防 520 处理：若 HTTPS 连接出现 520 异常，自动降级尝试 HTTP
-      if (response.status === 520 && TARGET_PROTOCOL === "https") {
-        const fallbackUrl = new URL(targetUrl.toString());
-        fallbackUrl.protocol = "http:";
-        fallbackUrl.port = "80";
-
-        const fallbackHeaders = new Headers(newHeaders);
-        fallbackHeaders.set("Host", TARGET_HOST);
-        if (fallbackHeaders.has("Origin")) {
-          fallbackHeaders.set("Origin", `http://${TARGET_HOST}`);
-        }
-
-        const fallbackReq = new Request(fallbackUrl.toString(), {
+      // 如果当前 IP 偶发异常，轮询尝试备用源站 IP
+      if (response.status >= 500 && NUTSTORE_ORIGIN_IPS.length > 1) {
+        const backupHost = NUTSTORE_ORIGIN_IPS[1];
+        const backupUrl = new URL(targetUrl.toString());
+        backupUrl.hostname = backupHost;
+        const backupReq = new Request(backupUrl.toString(), {
           method: request.method,
-          headers: fallbackHeaders,
+          headers: newHeaders,
           body: hasBody ? request.body : null,
           redirect: "manual",
         });
-
-        response = await fetch(fallbackReq);
+        response = await fetch(backupReq);
       }
 
-      // 7. 处理返回头（改写 Location 重定向域名）
+      // 6. 处理返回头（若包含 Location 重定向，将其改写为客户端访问的域名）
       const respHeaders = new Headers(response.headers);
       const location = respHeaders.get("Location");
       if (location) {
         try {
           const locUrl = new URL(location);
-          if (locUrl.hostname === TARGET_HOST) {
+          if (locUrl.hostname === TARGET_HOST || NUTSTORE_ORIGIN_IPS.includes(locUrl.hostname)) {
             locUrl.hostname = clientUrl.hostname;
             locUrl.protocol = clientUrl.protocol;
             locUrl.port = clientUrl.port;
