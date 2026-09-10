@@ -49,6 +49,19 @@ export default {
       pathname = "/dav/";
     }
 
+    if (request.method.toUpperCase() === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, DELETE, OPTIONS, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE, LOCK, UNLOCK",
+          "Access-Control-Allow-Headers": "*",
+          "Access-Control-Expose-Headers": "*",
+          "Access-Control-Max-Age": "86400",
+        },
+      });
+    }
+
     try {
       // 2. 通过 cloudflare:sockets 建立与坚果云电信机房的原生 TCP 连接
       const socket = connect({
@@ -189,25 +202,37 @@ export default {
       }
 
       // 5. 将剩余及后续数据流无缝返回给客户端
-      const bodyStream = new ReadableStream({
-        async start(controller) {
-          if (remainingBody.length > 0) {
-            controller.enqueue(remainingBody);
-          }
-          try {
-            while (true) {
-              const { done, value } = await socketReader.read();
-              if (done) {
-                controller.close();
-                break;
+      const hasNoBody =
+        [101, 204, 205, 304].includes(statusCode) ||
+        request.method.toUpperCase() === "HEAD";
+
+      const bodyStream = hasNoBody
+        ? null
+        : new ReadableStream({
+            async start(controller) {
+              if (remainingBody.length > 0) {
+                controller.enqueue(remainingBody);
               }
-              controller.enqueue(value);
-            }
-          } catch (e) {
-            controller.error(e);
-          }
-        },
-      });
+              try {
+                while (true) {
+                  const { done, value } = await socketReader.read();
+                  if (done) {
+                    controller.close();
+                    break;
+                  }
+                  controller.enqueue(value);
+                }
+              } catch (e) {
+                controller.error(e);
+              }
+            },
+          });
+
+      // 添加通用 CORS 标头，保证 Obsidian 等客户端正常跨域通信
+      responseHeaders.set("Access-Control-Allow-Origin", "*");
+      responseHeaders.set("Access-Control-Allow-Headers", "*");
+      responseHeaders.set("Access-Control-Allow-Methods", "*");
+      responseHeaders.set("Access-Control-Expose-Headers", "*");
 
       return new Response(bodyStream, {
         status: statusCode,
@@ -222,7 +247,10 @@ export default {
         }),
         {
           status: 502,
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+          },
         }
       );
     }
